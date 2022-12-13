@@ -6,40 +6,53 @@
 
 package studio.core.v1.writer.archive;
 
+import java.io.IOException;
+import java.net.URI;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.UUID;
+
 import com.google.gson.stream.JsonWriter;
-import org.apache.commons.codec.digest.DigestUtils;
-import org.apache.commons.io.IOUtils;
+
 import studio.core.v1.model.ActionNode;
 import studio.core.v1.model.Node;
 import studio.core.v1.model.StageNode;
 import studio.core.v1.model.StoryPack;
 import studio.core.v1.model.enriched.EnrichedNodePosition;
 import studio.core.v1.model.enriched.EnrichedNodeType;
+import studio.core.v1.utils.SecurityUtils;
+import studio.core.v1.writer.StoryPackWriter;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.util.*;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
+public class ArchiveStoryPackWriter implements StoryPackWriter {
 
-public class ArchiveStoryPackWriter {
+    private static final Map<String,String> ZIPFS_OPTIONS = Map.of("create", "true");
 
-    public void write(StoryPack pack, OutputStream outputStream) throws IOException {
-
+    public void write(StoryPack pack, Path zipPath, boolean enriched) throws IOException {
         // Zip archive contains a json file and separate assets
-        ZipOutputStream zos = new ZipOutputStream(outputStream);
+        URI uri = URI.create("jar:" + zipPath.toUri());
+        try (FileSystem zipFs = FileSystems.newFileSystem(uri, ZIPFS_OPTIONS)) {
+            // Store assets bytes
+            TreeMap<String, byte[]> assets = new TreeMap<>();
+            // Add story descriptor file: story.json
+            Path storyPath = zipFs.getPath("story.json");
+            try (JsonWriter writer = new JsonWriter(Files.newBufferedWriter(storyPath))) {
+                writeStoryJson(pack, writer, assets);
+            }
+            // Add assets in separate directory
+            Path assetPath = Files.createDirectories(zipFs.getPath("assets/"));
+            for (Map.Entry<String, byte[]> a : assets.entrySet()) {
+                Files.write(assetPath.resolve(a.getKey()), a.getValue());
+            }
+        }
+    }
 
-        // Store assets bytes
-        TreeMap<String, byte[]> assets = new TreeMap<>();
-
-
-        // Add story descriptor file: story.json
-        ZipEntry zipEntry = new ZipEntry("story.json");
-        zos.putNextEntry(zipEntry);
-
+    private void writeStoryJson(StoryPack pack, JsonWriter writer, TreeMap<String, byte[]> assets) throws IOException {
         // Start json document
-        JsonWriter writer = new JsonWriter(new OutputStreamWriter(zos));
         writer.setIndent("    ");
         writer.beginObject();
 
@@ -49,11 +62,7 @@ public class ArchiveStoryPackWriter {
         // Write (optional) enriched pack metadata
         if (pack.getEnriched() != null) {
             String packTitle = pack.getEnriched().getTitle();
-            if (packTitle != null) {
-                writer.name("title").value(packTitle);
-            } else {
-                writer.name("title").value("MISSING_PACK_TITLE");
-            }
+            writer.name("title").value(packTitle != null ? packTitle : "MISSING_PACK_TITLE");
             if (pack.getEnriched().getDescription() != null) {
                 writer.name("description").value(pack.getEnriched().getDescription());
             }
@@ -74,14 +83,12 @@ public class ArchiveStoryPackWriter {
             StageNode node = pack.getStageNodes().get(i);
             writer.beginObject();
             writer.name("uuid").value(node.getUuid());
-
             // Write (optional) enriched node metadata
             if (node.getEnriched() != null) {
                 writeEnrichedNodeMetadata(writer, node);
             }
-
+            // The first stage node is marked as such
             if (i == 0) {
-                // The first stage node is marked as such
                 writer.name("squareOne").value(true);
             }
             writer.name("image");
@@ -89,8 +96,8 @@ public class ArchiveStoryPackWriter {
                 writer.nullValue();
             } else {
                 byte[] imageData = node.getImage().getRawData();
-                String extension = extensionFromMimeType(node.getImage().getMimeType());
-                String assetFileName = DigestUtils.sha1Hex(imageData) + extension;
+                String extension = node.getImage().getType().getFirstExtension();
+                String assetFileName = SecurityUtils.sha1Hex(imageData) + extension;
                 writer.value(assetFileName);
                 assets.putIfAbsent(assetFileName, imageData);
             }
@@ -99,8 +106,8 @@ public class ArchiveStoryPackWriter {
                 writer.nullValue();
             } else {
                 byte[] audioData = node.getAudio().getRawData();
-                String extension = extensionFromMimeType(node.getAudio().getMimeType());
-                String assetFileName = DigestUtils.sha1Hex(audioData) + extension;
+                String extension = node.getAudio().getType().getFirstExtension();
+                String assetFileName = SecurityUtils.sha1Hex(audioData) + extension;
                 writer.value(assetFileName);
                 assets.putIfAbsent(assetFileName, audioData);
             }
@@ -164,29 +171,11 @@ public class ArchiveStoryPackWriter {
 
         writer.endObject();
         writer.flush();
-
-
-        // Add assets in separate directory
-        zipEntry = new ZipEntry("assets/");
-        zos.putNextEntry(zipEntry);
-        for (Map.Entry<String, byte[]> assetEntry : assets.entrySet()) {
-            String assetPath = "assets/" + assetEntry.getKey();
-            zipEntry = new ZipEntry(assetPath);
-            zos.putNextEntry(zipEntry);
-            IOUtils.write(assetEntry.getValue(), zos);
-        }
-
-        zos.flush();
-        zos.close();
     }
 
     private void writeEnrichedNodeMetadata(JsonWriter writer, Node node) throws IOException {
         String nodeName = node.getEnriched().getName();
-        if (nodeName != null) {
-            writer.name("name").value(nodeName);
-        } else {
-            writer.name("name").value("MISSING_NAME");
-        }
+        writer.name("name").value(nodeName != null ? nodeName : "MISSING_NAME");
         EnrichedNodeType nodeType = node.getEnriched().getType();
         if (nodeType != null) {
             writer.name("type").value(nodeType.label);
@@ -202,25 +191,6 @@ public class ArchiveStoryPackWriter {
             writer.name("x").value(nodePosition.getX());
             writer.name("y").value(nodePosition.getY());
             writer.endObject();
-        }
-    }
-
-    private String extensionFromMimeType(String mimeType) {
-        switch (mimeType) {
-            case "image/bmp":
-                return ".bmp";
-            case "image/png":
-                return ".png";
-            case "image/jpeg":
-                return ".jpg";
-            case "audio/x-wav":
-                return ".wav";
-            case "audio/mpeg":
-                return ".mp3";
-            case "audio/ogg":
-                return ".ogg";
-            default:
-                return "";
         }
     }
 

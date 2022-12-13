@@ -2,7 +2,6 @@
 # For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-maven
 
 name: Nightly Build
-
 on:
   push:
     branches: [ master ]
@@ -11,19 +10,68 @@ on:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+        java: [ 11, 17 ]
+        include:
+          - os: ubuntu-latest
+            java: 11
+            mode: deploy
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
-    - name: Set up JDK 11
-      uses: actions/setup-java@v1
+      uses: actions/checkout@v3
       with:
-        java-version: 11
-    - name: Build with Maven
-      run: mvn -B package --file pom.xml
+        fetch-depth: 0  # Shallow clone
+
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v3
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+        cache: maven
+
+    - name: Test with Maven
+      run: mvn test -B -Pide '-Dmaven.test.failure.ignore=true'
+      if: matrix.mode != 'deploy'
+
+    - name: Cache SonarCloud packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
+      if: matrix.mode == 'deploy'
+
+    - name: Sonar analyze
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        MVN_SONAR: ${{ 'org.sonarsource.scanner.maven:sonar-maven-plugin' }}
+        MVN_JACOCO: ${{ 'org.jacoco:jacoco-maven-plugin:0.8.5' }}
+        MVN_PARAMS: '-Pide -Dmaven.test.failure.ignore=true -Dsonar.projectKey=kairoh_studio'
+      # Ide profile to skip javascript 
+      run: mvn -B ${MVN_JACOCO}:prepare-agent verify ${MVN_JACOCO}:report ${MVN_SONAR}:sonar ${MVN_PARAMS}
+      if: matrix.mode == 'deploy'
+
+    - name: Publish Test Report
+      uses: mikepenz/action-junit-report@v3
+      with:
+        report_paths: '**/surefire-reports/TEST-*.xml'
+        check_name: test (${{ matrix.os }}, ${{ matrix.java }})
+      if: always()
+
+    - name: Package with Maven
+      run: mvn package -B '-DskipTests'
+      if: matrix.mode == 'deploy'
+
     - name: Upload artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         path: web-ui/target/*.zip
+      if: matrix.mode == 'deploy'
+

@@ -6,127 +6,103 @@
 
 package studio.webui.api;
 
+import java.nio.file.Path;
+import java.util.List;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
-import io.vertx.core.json.Json;
 import io.vertx.core.json.JsonObject;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
 import io.vertx.ext.web.Router;
+import studio.core.v1.utils.PackFormat;
 import studio.webui.service.IStoryTellerService;
 import studio.webui.service.LibraryService;
 
-import java.io.File;
-import java.util.List;
-
 public class DeviceController {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(DeviceController.class);
+    private static final Logger LOGGER = LogManager.getLogger(DeviceController.class);
 
+    private DeviceController() {
+        throw new IllegalArgumentException("Utility class");
+    }
 
-    public static Router apiRouter(Vertx vertx, IStoryTellerService storyTellerService, LibraryService libraryService) {
+    public static Router apiRouter(Vertx vertx, IStoryTellerService storyTellerService) {
         Router router = Router.router(vertx);
 
         // Plugged device metadata
-        router.get("/infos").handler(ctx -> {
-            storyTellerService.deviceInfos()
-                    .whenComplete((maybeDeviceInfos, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to read device infos", e);
-                            ctx.fail(500, e);
-                        } else {
-                            maybeDeviceInfos.ifPresentOrElse(
-                                    deviceInfos -> ctx.response()
-                                            .putHeader("content-type", "application/json")
-                                            .end(Json.encode(deviceInfos.put("plugged", true))),
-                                    () -> ctx.response()
-                                            .putHeader("content-type", "application/json")
-                                            .end(Json.encode(new JsonObject().put("plugged", false)))
-                            );
-                        }
-                    });
-        });
+        router.get("/infos").handler(ctx -> Future.fromCompletionStage(storyTellerService.deviceInfos()) //
+                .onFailure(e -> {
+                    LOGGER.error("Failed to read device infos", e);
+                    ctx.fail(500, e);
+                }) //
+                .onSuccess(ctx::json) //
+        );
 
         // Plugged device packs list
-        router.get("/packs").handler(ctx -> {
-            storyTellerService.packs()
-                    .whenComplete((devicePacks, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to read packs from device", e);
-                            ctx.fail(500, e);
-                        } else {
-                            ctx.response()
-                                    .putHeader("content-type", "application/json")
-                                    .end(Json.encode(devicePacks));
-                        }
-                    });
-        });
+        router.get("/packs").handler(ctx -> Future.fromCompletionStage(storyTellerService.packs()) //
+                .onFailure(e -> {
+                    LOGGER.error("Failed to read packs from device", e);
+                    ctx.fail(500, e);
+                }) //
+                .onSuccess(ctx::json) //
+        );
 
         // Add pack from library to device
         router.post("/addFromLibrary").blockingHandler(ctx -> {
             String uuid = ctx.getBodyAsJson().getString("uuid");
             String packPath = ctx.getBodyAsJson().getString("path");
-            File packFile = new File(libraryService.libraryPath() + packPath);
+            Path packFile = LibraryService.libraryPath().resolve(packPath);
             // Start transfer to device
-            storyTellerService.addPack(uuid, packFile)
-                    .whenComplete((maybeTransferId, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to transfer pack to device", e);
-                            ctx.fail(500, e);
-                        } else {
-                            maybeTransferId
-                                    .ifPresentOrElse(
-                                            transferId ->
-                                                    // Return the transfer id, which is used to monitor transfer progress
-                                                    ctx.response()
-                                                            .putHeader("content-type", "application/json")
-                                                            .end(Json.encode(new JsonObject().put("transferId", transferId))),
-                                            () -> {
-                                                LOGGER.error("Failed to transfer pack to device");
-                                                ctx.fail(500);
-                                            }
-                                    );
-                        }
-                    });
+            Future.fromCompletionStage(storyTellerService.addPack(uuid, packFile)) //
+                    .onFailure(e -> {
+                        LOGGER.error("Failed to transfer pack to device", e);
+                        ctx.fail(500, e);
+                    }) //
+                    .onSuccess(optTransferId -> optTransferId.ifPresentOrElse(
+                            // Return the transfer id, which is used to monitor transfer progress
+                            transferId -> ctx.json(new JsonObject().put("transferId", transferId)), //
+                            () -> {
+                                LOGGER.error("Failed to transfer pack to device");
+                                ctx.fail(500);
+                            }) //
+            );
         });
 
         // Remove pack from device
         router.post("/removeFromDevice").handler(ctx -> {
             String uuid = ctx.getBodyAsJson().getString("uuid");
-            storyTellerService.deletePack(uuid)
-                    .whenComplete((removed, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to remove pack from device", e);
-                            ctx.fail(500, e);
+            Future.fromCompletionStage(storyTellerService.deletePack(uuid)) //
+                    .onFailure(e -> {
+                        LOGGER.error("Failed to remove pack from device", e);
+                        ctx.fail(500, e);
+                    }) //
+                    .onSuccess(removed -> {
+                        if (Boolean.TRUE.equals(removed)) {
+                            ctx.json(new JsonObject().put("success", true));
                         } else {
-                            if (removed) {
-                                ctx.response()
-                                        .putHeader("content-type", "application/json")
-                                        .end(Json.encode(new JsonObject().put("success", true)));
-                            } else {
-                                LOGGER.error("Pack was not removed from device");
-                                ctx.fail(500);
-                            }
+                            LOGGER.error("Pack was not removed from device");
+                            ctx.fail(500);
                         }
                     });
         });
 
         // Reorder packs on device
         router.post("/reorder").handler(ctx -> {
+            @SuppressWarnings("unchecked")
             List<String> uuids = ctx.getBodyAsJson().getJsonArray("uuids").getList();
-            storyTellerService.reorderPacks(uuids)
-                    .whenComplete((reordered, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to reorder packs on device", e);
-                            ctx.fail(500, e);
+            Future.fromCompletionStage(storyTellerService.reorderPacks(uuids)) //
+                    .onFailure(e -> {
+                        LOGGER.error("Failed to reorder packs on device", e);
+                        ctx.fail(500, e);
+                    }) //
+                    .onSuccess(reordered -> {
+                        if (Boolean.TRUE.equals(reordered)) {
+                            ctx.json(new JsonObject().put("success", true));
                         } else {
-                            if (reordered) {
-                                ctx.response()
-                                        .putHeader("content-type", "application/json")
-                                        .end(Json.encode(new JsonObject().put("success", true)));
-                            } else {
-                                LOGGER.error("Failed to reorder packs on device");
-                                ctx.fail(500);
-                            }
+                            LOGGER.error("Failed to reorder packs on device");
+                            ctx.fail(500);
                         }
                     });
         });
@@ -136,52 +112,41 @@ public class DeviceController {
             String uuid = ctx.getBodyAsJson().getString("uuid");
             String driver = ctx.getBodyAsJson().getString("driver");
             // Transfer pack file to library file
-            String path = null;
-            if ("raw".equalsIgnoreCase(driver)) {
-                path = libraryService.libraryPath() + uuid + ".pack";
-            } else if ("fs".equalsIgnoreCase(driver)) {
-                path = libraryService.libraryPath();
+            Path path = null;
+            if (PackFormat.RAW.name().equalsIgnoreCase(driver)) {
+                path = LibraryService.libraryPath().resolve(uuid + ".pack");
+            } else if (PackFormat.FS.name().equalsIgnoreCase(driver)) {
+                path = LibraryService.libraryPath();
             } else {
                 ctx.fail(400);
                 return;
             }
-            storyTellerService.extractPack(uuid, new File(path))
-                    .whenComplete((maybeTransferId, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to transfer pack from device", e);
-                            ctx.fail(500, e);
-                        } else {
-                            maybeTransferId
-                                    .ifPresentOrElse(
-                                            transferId ->
-                                                    // Return the transfer id, which is used to monitor transfer progress
-                                                    ctx.response()
-                                                            .putHeader("content-type", "application/json")
-                                                            .end(Json.encode(new JsonObject().put("transferId", transferId))),
-                                            () -> {
-                                                LOGGER.error("Failed to transfer pack from device");
-                                                ctx.fail(500);
-                                            }
-                                    );
-                        }
-                    });
+            Future.fromCompletionStage(storyTellerService.extractPack(uuid, path)) //
+                    .onFailure(e -> {
+                        LOGGER.error("Failed to transfer pack from device", e);
+                        ctx.fail(500, e);
+                    }) //
+                    .onSuccess(optTransferId -> 
+                        optTransferId.ifPresentOrElse(
+                                // Return the transfer id, which is used to monitor transfer progress
+                                transferId -> ctx.json(new JsonObject().put("transferId", transferId)), //
+                                () -> {
+                                    LOGGER.error("Failed to transfer pack from device");
+                                    ctx.fail(500);
+                                })
+                    );
         });
 
         // Dump important sectors
         router.post("/dump").handler(ctx -> {
-            String outputPath = ctx.getBodyAsJson().getString("outputPath");
+            Path outputPath = Path.of(ctx.getBodyAsJson().getString("outputPath"));
             // Dump important sector into outputPath
-            storyTellerService.dump(outputPath)
-                    .whenComplete((done, e) -> {
-                        if (e != null) {
-                            LOGGER.error("Failed to dump important sectors from device", e);
-                            ctx.fail(500, e);
-                        } else {
-                            ctx.response()
-                                    .putHeader("content-type", "application/json")
-                                    .end(Json.encode(new JsonObject().put("success", true)));
-                        }
-                    });
+            Future.fromCompletionStage(storyTellerService.dump(outputPath)) //
+                    .onFailure(e -> {
+                        LOGGER.error("Failed to dump important sectors from device", e);
+                        ctx.fail(500, e);
+                    }) //
+                    .onSuccess(s -> ctx.json(new JsonObject().put("success", true)));
         });
 
         return router;

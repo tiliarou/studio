@@ -8,7 +8,7 @@ package studio.driver.event;
 
 import studio.driver.model.TransferStatus;
 
+@FunctionalInterface
 public interface TransferProgressListener {
     void onProgress(TransferStatus status);
-    void onComplete(TransferStatus status);
 }

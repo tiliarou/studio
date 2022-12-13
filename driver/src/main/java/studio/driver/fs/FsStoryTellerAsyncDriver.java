@@ -6,34 +6,49 @@
 
 package studio.driver.fs;
 
-import org.apache.commons.codec.binary.Hex;
+import static studio.core.v1.writer.fs.FsStoryPackWriter.transformUuid;
+
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.FileStore;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.usb4java.Device;
+
+import studio.core.v1.utils.SecurityUtils;
+import studio.core.v1.utils.exception.StoryTellerException;
+import studio.core.v1.utils.stream.ThrowingConsumer;
 import studio.core.v1.writer.fs.FsStoryPackWriter;
 import studio.driver.DeviceVersion;
 import studio.driver.LibUsbDetectionHelper;
-import studio.driver.model.fs.FsDeviceInfos;
-import studio.driver.model.fs.FsStoryPackInfos;
-import studio.driver.StoryTellerException;
-import studio.driver.event.DeviceHotplugEventListener;
+import studio.driver.StoryTellerAsyncDriver;
+import studio.driver.event.DevicePluggedListener;
+import studio.driver.event.DeviceUnpluggedListener;
 import studio.driver.event.TransferProgressListener;
 import studio.driver.model.TransferStatus;
+import studio.driver.model.fs.FsDeviceInfos;
+import studio.driver.model.fs.FsStoryPackInfos;
 
-import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+public class FsStoryTellerAsyncDriver implements StoryTellerAsyncDriver<FsDeviceInfos, FsStoryPackInfos> {
 
-public class FsStoryTellerAsyncDriver {
-
-    private static final Logger LOGGER = Logger.getLogger(FsStoryTellerAsyncDriver.class.getName());
+    private static final Logger LOGGER = LogManager.getLogger(FsStoryTellerAsyncDriver.class);
 
     private static final String DEVICE_METADATA_FILENAME = ".md";
     private static final String PACK_INDEX_FILENAME = ".pi";
@@ -46,223 +61,188 @@ public class FsStoryTellerAsyncDriver {
 
 
     private Device device = null;
-    private String partitionMountPoint = null;
-    private List<DeviceHotplugEventListener> listeners = new ArrayList<>();
-
+    private Path partitionMountPoint = null;
+    private List<DevicePluggedListener> pluggedlisteners = new ArrayList<>();
+    private List<DeviceUnpluggedListener> unpluggedlisteners = new ArrayList<>();
 
     public FsStoryTellerAsyncDriver() {
         // Initialize libusb, handle and propagate hotplug events
-        LOGGER.fine("Registering hotplug listener");
-        LibUsbDetectionHelper.initializeLibUsb(DeviceVersion.DEVICE_VERSION_2, new DeviceHotplugEventListener() {
-                    @Override
-                    public void onDevicePlugged(Device device) {
-                        // Wait for a partition to be mounted which contains the .md file
-                        LOGGER.fine("Waiting for device partition...");
-                        for (int i = 0; i < FS_MOUNTPOINT_RETRY && partitionMountPoint==null; i++) {
-                            try {
-                                Thread.sleep(FS_MOUNTPOINT_POLL_DELAY);
-                                DeviceUtils.listMountPoints().forEach(path -> {
-                                    LOGGER.finest("Looking for .md file on mount point / drive: " + path);
-                                    File mdFile = new File(path, DEVICE_METADATA_FILENAME);
-                                    if (mdFile.exists()) {
-                                        partitionMountPoint = path;
-                                        LOGGER.info("FS device partition located: " + partitionMountPoint);
-                                    }
-                                });
-                            } catch (InterruptedException e) {
-                                LOGGER.log(Level.SEVERE, "Failed to locate device partition", e);
-                            }
+        LOGGER.debug("Registering hotplug listener");
+        LibUsbDetectionHelper.initializeLibUsb(DeviceVersion.DEVICE_VERSION_2, //
+                device2 -> {
+                    // Wait for a partition to be mounted which contains the .md file
+                    LOGGER.debug("Waiting for device partition...");
+                    for (int i = 0; i < FS_MOUNTPOINT_RETRY && partitionMountPoint == null; i++) {
+                        try {
+                            Thread.sleep(FS_MOUNTPOINT_POLL_DELAY);
+                            DeviceUtils.listMountPoints().forEach(path -> {
+                                LOGGER.trace("Looking for .md in {}", path);
+                                if (Files.exists(path.resolve(DEVICE_METADATA_FILENAME))) {
+                                    partitionMountPoint = path;
+                                    LOGGER.info("FS device partition located: {}", partitionMountPoint);
+                                }
+                            });
+                        } catch (InterruptedException e) {
+                            LOGGER.error("Failed to locate device partition", e);
+                            Thread.currentThread().interrupt();
                         }
-
-                        if (partitionMountPoint == null) {
-                            throw new StoryTellerException("Could not locate device partition");
-                        }
-
-                        // Update device reference
-                        FsStoryTellerAsyncDriver.this.device = device;
-                        // Notify listeners
-                        FsStoryTellerAsyncDriver.this.listeners.forEach(listener -> listener.onDevicePlugged(device));
                     }
-
-                    @Override
-                    public void onDeviceUnplugged(Device device) {
-                        // Update device reference
-                        FsStoryTellerAsyncDriver.this.device = null;
-                        FsStoryTellerAsyncDriver.this.partitionMountPoint = null;
-                        // Notify listeners
-                        FsStoryTellerAsyncDriver.this.listeners.forEach(listener -> listener.onDeviceUnplugged(device));
+                    if (partitionMountPoint == null) {
+                        throw new StoryTellerException("Could not locate device partition");
                     }
-                }
-        );
+                    // Update device reference
+                    FsStoryTellerAsyncDriver.this.device = device2;
+                    // Notify listeners
+                    FsStoryTellerAsyncDriver.this.pluggedlisteners.forEach(l -> l.onDevicePlugged(device2));
+                }, //
+                device2 -> {
+                    // Update device reference
+                    FsStoryTellerAsyncDriver.this.device = null;
+                    FsStoryTellerAsyncDriver.this.partitionMountPoint = null;
+                    // Notify listeners
+                    FsStoryTellerAsyncDriver.this.unpluggedlisteners.forEach(l -> l.onDeviceUnplugged(device2));
+                });
     }
 
-
-    public void registerDeviceListener(DeviceHotplugEventListener listener) {
-        this.listeners.add(listener);
+    public void registerDeviceListener(DevicePluggedListener pluggedlistener, DeviceUnpluggedListener unpluggedlistener) {
+        this.pluggedlisteners.add(pluggedlistener);
+        this.unpluggedlisteners.add(unpluggedlistener);
         if (this.device != null) {
-            listener.onDevicePlugged(this.device);
+            pluggedlistener.onDevicePlugged(this.device);
         }
     }
 
-
-    public CompletableFuture<FsDeviceInfos> getDeviceInfos() {
+    public CompletionStage<FsDeviceInfos> getDeviceInfos() {
         if (this.device == null || this.partitionMountPoint == null) {
-            return CompletableFuture.failedFuture(new StoryTellerException("No device plugged"));
+            return CompletableFuture.failedFuture(noDevicePluggedException());
         }
         FsDeviceInfos infos = new FsDeviceInfos();
-        try {
-            String mdFile = this.partitionMountPoint + File.separator + DEVICE_METADATA_FILENAME;
-            LOGGER.finest("Reading device infos from file: " + mdFile);
-            FileInputStream deviceMetadataFis = new FileInputStream(mdFile);
+        Path mdFile = this.partitionMountPoint.resolve(DEVICE_METADATA_FILENAME);
+        LOGGER.trace("Reading device infos from file: {}", mdFile);
 
+        try(DataInputStream is = new DataInputStream(new BufferedInputStream(Files.newInputStream(mdFile)))) {
             // MD file format version
-            short mdVersion = readLittleEndianShort(deviceMetadataFis);
-            LOGGER.finest("Device metadata format version: " + mdVersion);
+            short mdVersion = DeviceUtils.readLittleEndianShort(is);
+            LOGGER.trace("Device metadata format version: {}", mdVersion);
             if (mdVersion < 1 || mdVersion > 3) {
                 return CompletableFuture.failedFuture(new StoryTellerException("Unsupported device metadata format version: " + mdVersion));
             }
 
             // Firmware version
-            deviceMetadataFis.skip(4);
-            short major = readLittleEndianShort(deviceMetadataFis);
-            short minor = readLittleEndianShort(deviceMetadataFis);
+            is.skipBytes(4);
+            short major = DeviceUtils.readLittleEndianShort(is);
+            short minor = DeviceUtils.readLittleEndianShort(is);
             infos.setFirmwareMajor(major);
             infos.setFirmwareMinor(minor);
-            LOGGER.fine("Firmware version: " + major + "." + minor);
+            LOGGER.debug("Firmware version: {}.{}", major, minor);
 
             // Serial number
             String serialNumber = null;
-            long sn = readBigEndianLong(deviceMetadataFis);
+            long sn = DeviceUtils.readBigEndianLong(is);
             if (sn != 0L && sn != -1L && sn != -4294967296L) {
                 serialNumber = String.format("%014d", sn);
-                LOGGER.fine("Serial Number: " + serialNumber);
+                LOGGER.debug("Serial Number: {}", serialNumber);
             } else {
-                LOGGER.warning("No serial number in SPI");
+                LOGGER.warn("No serial number in SPI");
             }
             infos.setSerialNumber(serialNumber);
 
             // UUID
-            deviceMetadataFis.skip(238);
-            byte[] uuid = deviceMetadataFis.readNBytes(256);
-            infos.setUuid(uuid);
-            LOGGER.fine("UUID: " + Hex.encodeHexString(uuid));
-
-            deviceMetadataFis.close();
+            is.skipBytes(238);
+            byte[] deviceId = is.readNBytes(256);
+            infos.setDeviceId(deviceId);
+            if(LOGGER.isDebugEnabled()) {
+                LOGGER.debug("UUID: {}", SecurityUtils.encodeHex(deviceId));
+            }
 
             // SD card size and used space
-            File mdFd = new File(mdFile);
+            FileStore mdFd = Files.getFileStore(mdFile); 
             long sdCardTotalSpace = mdFd.getTotalSpace();
-            long sdCardUsedSpace = mdFd.getTotalSpace() - mdFd.getFreeSpace();
+            long sdCardUsedSpace = mdFd.getTotalSpace() - mdFd.getUnallocatedSpace();
+            double percent = Math.round(100d * 100d * sdCardUsedSpace / sdCardTotalSpace) / 100d;
             infos.setSdCardSizeInBytes(sdCardTotalSpace);
             infos.setUsedSpaceInBytes(sdCardUsedSpace);
-            LOGGER.fine("SD card size: " + sdCardTotalSpace);
-            LOGGER.fine("SD card used space: " + sdCardUsedSpace);
+            if(LOGGER.isDebugEnabled()) {
+                LOGGER.debug("SD card used : {}% ({} / {})", percent, FileUtils.readableByteSize(sdCardUsedSpace), FileUtils.readableByteSize(sdCardTotalSpace) );
+            }
         } catch (Exception e) {
             return CompletableFuture.failedFuture(new StoryTellerException("Failed to read device metadata on partition", e));
         }
-
         return CompletableFuture.completedFuture(infos);
     }
 
-    private short readLittleEndianShort(FileInputStream fis) throws IOException {
-        byte[] buffer = new byte[2];
-        fis.read(buffer);
-        ByteBuffer bb = ByteBuffer.wrap(buffer);
-        bb.order(ByteOrder.LITTLE_ENDIAN);
-        return bb.getShort();
-    }
-
-    private long readBigEndianLong(FileInputStream fis) throws IOException {
-        byte[] buffer = new byte[8];
-        fis.read(buffer);
-        ByteBuffer bb = ByteBuffer.wrap(buffer);
-        bb.order(ByteOrder.BIG_ENDIAN);
-        return bb.getLong();
-    }
-
-
-    public CompletableFuture<List<FsStoryPackInfos>> getPacksList() {
+    public CompletionStage<List<FsStoryPackInfos>> getPacksList() {
         if (this.device == null || this.partitionMountPoint == null) {
-            return CompletableFuture.failedFuture(new StoryTellerException("No device plugged"));
+            return CompletableFuture.failedFuture(noDevicePluggedException());
         }
 
         return readPackIndex()
                 .thenApply(packUUIDs -> {
                     try {
-                        LOGGER.fine("Number of packs in index: " + packUUIDs.size());
+                        LOGGER.debug("Number of packs in index: {}", packUUIDs.size());
                         List<FsStoryPackInfos> packs = new ArrayList<>();
                         for (UUID packUUID : packUUIDs) {
                             FsStoryPackInfos packInfos = new FsStoryPackInfos();
                             packInfos.setUuid(packUUID);
-                            LOGGER.fine("Pack UUID: " + packUUID.toString());
+                            LOGGER.debug("Pack UUID: {}", packUUID);
 
                             // Compute .content folder (last 4 bytes of UUID)
-                            String folderName = computePackFolderName(packUUID.toString());
-                            String packFolderPath = this.partitionMountPoint + File.separator + CONTENT_FOLDER + File.separator + folderName;
+                            String folderName = transformUuid(packUUID.toString());
+                            Path packPath = this.partitionMountPoint.resolve(CONTENT_FOLDER).resolve(folderName);
                             packInfos.setFolderName(folderName);
 
                             // Open 'ni' file
-                            File packFolder = new File(packFolderPath);
-                            FileInputStream niFis = new FileInputStream(new File(packFolder, NODE_INDEX_FILENAME));
-                            DataInputStream niDis = new DataInputStream(niFis);
-                            ByteBuffer bb = ByteBuffer.wrap(niDis.readNBytes(512)).order(ByteOrder.LITTLE_ENDIAN);
-                            short version = bb.getShort(2);
-                            packInfos.setVersion(version);
-                            LOGGER.fine("Pack version: " + version);
-                            niDis.close();
-                            niFis.close();
-
+                            Path niPath = packPath.resolve(NODE_INDEX_FILENAME);
+                            try (InputStream niDis = new BufferedInputStream(Files.newInputStream(niPath))) {
+                                ByteBuffer bb = ByteBuffer.wrap(niDis.readNBytes(512)).order(ByteOrder.LITTLE_ENDIAN);
+                                short version = bb.getShort(2);
+                                packInfos.setVersion(version);
+                                LOGGER.debug("Pack version: {}", version);
+                            }
                             // Night mode is available if file 'nm' exists
-                            packInfos.setNightModeAvailable(new File(packFolder, NIGHT_MODE_FILENAME).exists());
-
+                            packInfos.setNightModeAvailable(Files.exists(packPath.resolve(NIGHT_MODE_FILENAME)));
                             // Compute folder size
-                            packInfos.setSizeInBytes((int) FileUtils.getFolderSize(packFolderPath));
+                            packInfos.setSizeInBytes(FileUtils.getFolderSize(packPath));
 
                             packs.add(packInfos);
                         }
                         return packs;
-                    } catch (Exception e) {
+                    } catch (IOException e) {
                         throw new StoryTellerException("Failed to read pack metadata on device partition", e);
                     }
                 });
     }
 
-    private CompletableFuture<List<UUID>> readPackIndex() {
+    private CompletionStage<List<UUID>> readPackIndex() {
         return CompletableFuture.supplyAsync(() -> {
             List<UUID> packUUIDs = new ArrayList<>();
+            Path piFile = this.partitionMountPoint.resolve(PACK_INDEX_FILENAME);
+            LOGGER.trace("Reading packs index from file: {}", piFile);
             try {
-                String piFile = this.partitionMountPoint + File.separator + PACK_INDEX_FILENAME;
-
-                LOGGER.finest("Reading packs index from file: " + piFile);
-                FileInputStream packIndexFis = new FileInputStream(piFile);
-
-                byte[] packUuid = new byte[16];
-                while (packIndexFis.read(packUuid) > 0) {
-                    ByteBuffer bb = ByteBuffer.wrap(packUuid);
+                ByteBuffer bb = ByteBuffer.wrap(Files.readAllBytes(piFile));
+                while (bb.hasRemaining()) {
                     long high = bb.getLong();
                     long low = bb.getLong();
                     packUUIDs.add(new UUID(high, low));
                 }
-
-                packIndexFis.close();
-
                 return packUUIDs;
-            } catch (Exception e) {
+            } catch (IOException e) {
                 throw new StoryTellerException("Failed to read pack index on device partition", e);
             }
         });
     }
 
 
-    public CompletableFuture<Boolean> reorderPacks(List<String> uuids) {
+    public CompletionStage<Boolean> reorderPacks(List<String> uuids) {
         if (this.device == null || this.partitionMountPoint == null) {
-            return CompletableFuture.failedFuture(new StoryTellerException("No device plugged"));
+            return CompletableFuture.failedFuture(noDevicePluggedException());
         }
 
         return readPackIndex()
                 .thenCompose(packUUIDs -> {
                     try {
-                        boolean allUUIDsAreOnDevice = uuids.stream().allMatch(uuid -> packUUIDs.stream().anyMatch(p -> p.equals(UUID.fromString(uuid))));
+                        boolean allUUIDsAreOnDevice = uuids.stream()
+                                .allMatch(uuid -> packUUIDs.stream().anyMatch(p -> p.equals(UUID.fromString(uuid))));
                         if (allUUIDsAreOnDevice) {
                             // Reorder list according to uuids list
                             packUUIDs.sort(Comparator.comparingInt(p -> uuids.indexOf(p.toString())));
@@ -277,9 +257,9 @@ public class FsStoryTellerAsyncDriver {
                 });
     }
 
-    public CompletableFuture<Boolean> deletePack(String uuid) {
+    public CompletionStage<Boolean> deletePack(String uuid) {
         if (this.device == null || this.partitionMountPoint == null) {
-            return CompletableFuture.failedFuture(new StoryTellerException("No device plugged"));
+            return CompletableFuture.failedFuture(noDevicePluggedException());
         }
 
         return readPackIndex()
@@ -288,17 +268,18 @@ public class FsStoryTellerAsyncDriver {
                         // Look for UUID in packs index
                         Optional<UUID> matched = packUUIDs.stream().filter(p -> p.equals(UUID.fromString(uuid))).findFirst();
                         if (matched.isPresent()) {
-                            LOGGER.fine("Found pack with uuid: " + uuid);
+                            LOGGER.debug("Found pack with uuid: {}", uuid);
                             // Remove from index
                             packUUIDs.remove(matched.get());
                             // Write pack index
                             return writePackIndex(packUUIDs)
                                     .thenCompose(ok -> {
                                         // Generate folder name
-                                        String folderName = this.partitionMountPoint + File.separator + CONTENT_FOLDER + File.separator + computePackFolderName(uuid);
-                                        LOGGER.fine("Removing pack folder: " + folderName);
+                                        String folderName = transformUuid(uuid);
+                                        Path folderPath = this.partitionMountPoint.resolve(CONTENT_FOLDER).resolve(folderName);
+                                        LOGGER.debug("Removing pack folder: {}", folderPath);
                                         try {
-                                            org.apache.commons.io.FileUtils.deleteDirectory(new File(folderName));
+                                            FileUtils.deleteDirectory(folderPath);
                                             return CompletableFuture.completedFuture(ok);
                                         } catch (IOException e) {
                                             return CompletableFuture.failedFuture(new StoryTellerException("Failed to delete pack folder on device partition", e));
@@ -313,27 +294,17 @@ public class FsStoryTellerAsyncDriver {
                 });
     }
 
-    private CompletableFuture<Boolean> writePackIndex(List<UUID> packUUIDs) {
-        // Because the hidden file cannot be modified on windows, we need to write to a temporary file
+    private CompletionStage<Boolean> writePackIndex(List<UUID> packUUIDs) {
         try {
-            String piFile = this.partitionMountPoint + File.separator + PACK_INDEX_FILENAME;
-            String newPiFile = piFile + ".new";
-            LOGGER.finest("Writing pack index to temporary file: " + newPiFile);
+            Path piFile = this.partitionMountPoint.resolve(PACK_INDEX_FILENAME);
 
-            FileOutputStream packIndexFos = new FileOutputStream(newPiFile);
-            DataOutputStream packIndexDos = new DataOutputStream(packIndexFos);
+            LOGGER.trace("Replacing pack index file: {}", piFile);
+            ByteBuffer bb = ByteBuffer.allocate(16 * packUUIDs.size());
             for (UUID packUUID : packUUIDs) {
-                packIndexDos.writeLong(packUUID.getMostSignificantBits());
-                packIndexDos.writeLong(packUUID.getLeastSignificantBits());
+                bb.putLong(packUUID.getMostSignificantBits());
+                bb.putLong(packUUID.getLeastSignificantBits());
             }
-            packIndexDos.close();
-            packIndexFos.close();
-
-            // Then replace file
-            LOGGER.finest("Replacing pack index file");
-            Files.copy(Paths.get(newPiFile), Paths.get(this.partitionMountPoint + File.separator + PACK_INDEX_FILENAME), StandardCopyOption.REPLACE_EXISTING);
-            LOGGER.finest("Deleting temporary pack index file");
-            Files.delete(Paths.get(newPiFile));
+            Files.write(piFile, bb.array());
 
             return CompletableFuture.completedFuture(true);
         } catch (Exception e) {
@@ -341,89 +312,76 @@ public class FsStoryTellerAsyncDriver {
         }
     }
 
-
-    public CompletableFuture<TransferStatus> downloadPack(String uuid, String outputPath, TransferProgressListener listener) {
+    public CompletionStage<TransferStatus> downloadPack(String uuid, Path destPath, TransferProgressListener listener) {
         if (this.device == null || this.partitionMountPoint == null) {
-            return CompletableFuture.failedFuture(new StoryTellerException("No device plugged"));
+            return CompletableFuture.failedFuture(noDevicePluggedException());
         }
-
         return readPackIndex()
                 .thenCompose(packUUIDs -> CompletableFuture.supplyAsync(() -> {
                     // Look for UUID in packs index
                     Optional<UUID> matched = packUUIDs.stream().filter(p -> p.equals(UUID.fromString(uuid))).findFirst();
-                    if (matched.isPresent()) {
-                        LOGGER.fine("Found pack with uuid: " + uuid);
-
-                        // Generate folder name
-                        String sourceFolder = this.partitionMountPoint + File.separator + CONTENT_FOLDER + File.separator + computePackFolderName(uuid);
-                        LOGGER.finest("Downloading pack folder: " + sourceFolder);
-
-                        if (Files.exists(Paths.get(sourceFolder))) {
-                            try {
-                                // Create destination folder
-                                File destFolder = new File(outputPath + File.separator + uuid);
-                                destFolder.mkdirs();
-                                // Copy folder with progress tracking
-                                return copyPackFolder(sourceFolder, destFolder, listener);
-                            } catch (IOException e) {
-                                throw new StoryTellerException("Failed to copy pack from device", e);
-                            }
-                        } else {
-                            throw new StoryTellerException("Pack folder not found");
-                        }
-                    } else {
+                    if (matched.isEmpty()) {
                         throw new StoryTellerException("Pack not found");
+                    }
+                    LOGGER.debug("Found pack with uuid: {}", uuid);
+
+                    // Generate folder name
+                    String folderName = transformUuid(uuid);
+                    Path sourceFolder = this.partitionMountPoint.resolve(CONTENT_FOLDER).resolve(folderName);
+                    LOGGER.trace("Downloading pack folder: {}", sourceFolder);
+                    if (Files.notExists(sourceFolder)) {
+                        throw new StoryTellerException("Pack folder not found");
+                    }
+
+                    try {
+                        // Destination folder
+                        Path destFolder = destPath.resolve(uuid);
+                        // Copy folder with progress tracking
+                        return copyPackFolder(sourceFolder, destFolder, listener);
+                    } catch (IOException e) {
+                        throw new StoryTellerException("Failed to copy pack from device", e);
                     }
                 }));
     }
 
-    public CompletableFuture<TransferStatus> uploadPack(String uuid, String inputPath, TransferProgressListener listener) {
+    public CompletionStage<TransferStatus> uploadPack(String uuid, Path inputPath, TransferProgressListener listener) {
         if (this.device == null || this.partitionMountPoint == null) {
-            return CompletableFuture.failedFuture(new StoryTellerException("No device plugged"));
+            return CompletableFuture.failedFuture(noDevicePluggedException());
         }
 
         try {
             // Check free space
-            int folderSize = (int) FileUtils.getFolderSize(inputPath);
-            LOGGER.finest("Pack folder size: " + folderSize);
-            String mdFile = this.partitionMountPoint + File.separator + DEVICE_METADATA_FILENAME;
-            File mdFd = new File(mdFile);
-            if (mdFd.getFreeSpace() < folderSize) {
+            long folderSize = FileUtils.getFolderSize(inputPath);
+            if(LOGGER.isTraceEnabled()) {
+                LOGGER.trace("Pack folder size: {}", FileUtils.readableByteSize(folderSize));
+            }
+            Path mdFile = this.partitionMountPoint.resolve(DEVICE_METADATA_FILENAME);
+            long freeSpace = Files.getFileStore(mdFile).getUsableSpace();
+            if(LOGGER.isTraceEnabled()) {
+                LOGGER.trace("SD free space: {}", FileUtils.readableByteSize(freeSpace));
+            }
+            if (freeSpace < folderSize) {
                 throw new StoryTellerException("Not enough free space on the device");
             }
 
             // Generate folder name
-            String folderName = this.partitionMountPoint + File.separator + CONTENT_FOLDER + File.separator + computePackFolderName(uuid);
-            LOGGER.fine("Uploading pack to folder: " + folderName);
+            String folderName = transformUuid(uuid);
+            Path folderPath = this.partitionMountPoint.resolve(CONTENT_FOLDER).resolve(folderName);
+            LOGGER.debug("Uploading pack to folder: {}", folderName);
 
-            // Create destination folder
-            File destFolder = new File(folderName);
-            destFolder.mkdirs();
             // Copy folder with progress tracking
             return CompletableFuture.supplyAsync(() -> {
                 try {
-                    return copyPackFolder(inputPath, destFolder, new TransferProgressListener() {
-                        @Override
-                        public void onProgress(TransferStatus status) {
-                            if (listener != null) {
-                                listener.onProgress(status);
-                            }
-                        }
-                        @Override
-                        public void onComplete(TransferStatus status) {
-                            // Not calling listener because the pack must be added to the index
-                        }
-                    });
+                    return copyPackFolder(inputPath, folderPath, listener); 
                 } catch (IOException e) {
                     throw new StoryTellerException("Failed to copy pack from device", e);
                 }
             }).thenCompose(status -> {
                 // When transfer is complete, generate device-specific boot file from device UUID
-                LOGGER.fine("Generating device-specific boot file");
+                LOGGER.debug("Generating device-specific boot file");
                 return getDeviceInfos().thenApply(deviceInfos -> {
                     try {
-                        FsStoryPackWriter writer = new FsStoryPackWriter();
-                        writer.addBootFile(destFolder.toPath(), deviceInfos.getUuid());
+                        FsStoryPackWriter.addBootFile(folderPath, deviceInfos.getDeviceId());
                         return status;
                     } catch (IOException e) {
                         throw new StoryTellerException("Failed to generate device-specific boot file", e);
@@ -431,75 +389,78 @@ public class FsStoryTellerAsyncDriver {
                 });
             }).thenCompose(status -> {
                 // Finally, add pack UUID to index
-                return readPackIndex()
-                        .thenCompose(packUUIDs -> {
-                            try {
-                                // Add UUID in packs index
-                                packUUIDs.add(UUID.fromString(uuid));
-                                // Write pack index
-                                return writePackIndex(packUUIDs)
-                                        .thenApply(ok -> {
-                                            if (listener != null) {
-                                                listener.onComplete(status);
-                                            }
-                                            return status;
-                                        });
-                            } catch (Exception e) {
-                                throw new StoryTellerException("Failed to write pack metadata on device partition", e);
-                            }
-                        });
+                LOGGER.debug("Add pack uuid to index");
+                return readPackIndex().thenCompose(packUUIDs -> {
+                    try {
+                        // Add UUID in packs index
+                        packUUIDs.add(UUID.fromString(uuid));
+                        // Write pack index
+                        return writePackIndex(packUUIDs).thenApply(ok -> status);
+                    } catch (Exception e) {
+                        throw new StoryTellerException("Failed to write pack metadata on device partition", e);
+                    }
+                });
             });
         } catch (IOException e) {
             throw new StoryTellerException("Failed to copy pack to device", e);
         }
     }
 
-    private TransferStatus copyPackFolder(String sourceFolder, File destFolder, TransferProgressListener listener) throws IOException {
+    private TransferStatus copyPackFolder(Path sourceFolder, Path destFolder, TransferProgressListener listener)
+            throws IOException {
         // Keep track of transferred bytes and elapsed time
         final long startTime = System.currentTimeMillis();
-        AtomicInteger transferred = new AtomicInteger(0);
-        int folderSize = (int) FileUtils.getFolderSize(sourceFolder);
-        LOGGER.finest("Pack folder size: " + folderSize);
+        AtomicLong transferred = new AtomicLong(0);
+        long folderSize = FileUtils.getFolderSize(sourceFolder);
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("Pack folder size: {}", FileUtils.readableByteSize(folderSize));
+        }
+        // Target directory
+        Files.createDirectories(destFolder);
         // Copy folders and files
-        Files.walk(Paths.get(sourceFolder))
-                .forEach(s -> {
-                    try {
-                        Path d = destFolder.toPath().resolve(Paths.get(sourceFolder).relativize(s));
-                        if (Files.isDirectory(s)) {
-                            if (!Files.exists(d)) {
-                                LOGGER.finer("Creating directory " + d.toString());
-                                Files.createDirectory(d);
-                            }
-                        } else {
-                            int fileSize = (int) FileUtils.getFileSize(s.toAbsolutePath().toString());
-                            LOGGER.finer("Copying file " + s.toString() + " to " + d.toString() + " (" + fileSize + " bytes)");
-                            Files.copy(s, d);
-
-                            // Compute progress and speed
-                            int xferred = transferred.addAndGet(fileSize);
-                            long elapsed = System.currentTimeMillis() - startTime;
-                            double speed = ((double) xferred) / ((double) elapsed / 1000.0);
-                            LOGGER.finer("Transferred " + xferred + " bytes in " + elapsed + " ms");
-                            LOGGER.finer("Average speed = " + speed + " bytes/sec");
-                            TransferStatus status = new TransferStatus(xferred == folderSize, xferred, folderSize, speed);
-
-                            // Call (optional) listener with transfer status
-                            if (listener != null) {
-                                CompletableFuture.runAsync(() -> listener.onProgress(status));
-                                if (status.isDone()) {
-                                    CompletableFuture.runAsync(() -> listener.onComplete(status));
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        throw new StoryTellerException("Failed to copy pack folder", e);
+        try (Stream<Path> paths = Files.walk(sourceFolder)) {
+            paths.forEach(ThrowingConsumer.unchecked(s -> {
+                Path d = destFolder.resolve(sourceFolder.relativize(s));
+                // Copy directory
+                if (Files.isDirectory(s)) {
+                    LOGGER.debug("Creating directory {}", d);
+                    Files.createDirectories(d);
+                } else {
+                    // Copy files
+                    long fileSize = FileUtils.getFileSize(s);
+                    if (LOGGER.isDebugEnabled()) {
+                        LOGGER.debug("Copying file {} ({}) to {}", s.getFileName(),
+                                FileUtils.readableByteSize(fileSize), d);
                     }
-                });
-        return new TransferStatus(transferred.get() == folderSize, transferred.get(), folderSize, 0.0);
+                    Files.copy(s, d, StandardCopyOption.REPLACE_EXISTING);
+
+                    // Compute progress and speed
+                    long xferred = transferred.addAndGet(fileSize);
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    double speed = xferred / (elapsed / 1000.0);
+                    if (LOGGER.isTraceEnabled()) {
+                        LOGGER.trace("Transferred {} in {} ms", FileUtils.readableByteSize(xferred), elapsed);
+                        LOGGER.trace("Average speed = {}/sec", FileUtils.readableByteSize((long) speed));
+                    }
+                    TransferStatus status = new TransferStatus(xferred, folderSize, speed);
+
+                    // Call (optional) listener with transfer status
+                    if (listener != null) {
+                        CompletableFuture.runAsync(() -> listener.onProgress(status));
+                    }
+                }
+            }));
+        }
+        return new TransferStatus(transferred.get(), folderSize, 0.0);
     }
 
-    public String computePackFolderName(String uuid) {
-        String uuidStr = uuid.replaceAll("-", "");
-        return uuidStr.substring(uuidStr.length() - 8).toUpperCase();
+    public CompletionStage<Void> dump(Path outputPath) {
+        // Not supported
+        LOGGER.warn("Not supported : dump");
+        return CompletableFuture.completedFuture(null);
+    }
+
+    private StoryTellerException noDevicePluggedException() {
+        return new StoryTellerException("No device plugged");
     }
 }

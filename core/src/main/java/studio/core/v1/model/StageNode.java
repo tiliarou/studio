@@ -6,6 +6,8 @@
 
 package studio.core.v1.model;
 
+import studio.core.v1.model.asset.AudioAsset;
+import studio.core.v1.model.asset.ImageAsset;
 import studio.core.v1.model.enriched.EnrichedNodeMetadata;
 
 public class StageNode extends Node {
@@ -16,9 +18,6 @@ public class StageNode extends Node {
     private Transition okTransition;
     private Transition homeTransition;
     private ControlSettings controlSettings;
-
-    public StageNode() {
-    }
 
     public StageNode(String uuid, ImageAsset image, AudioAsset audio, Transition okTransition, Transition homeTransition, ControlSettings controlSettings, EnrichedNodeMetadata enriched) {
         super(enriched);

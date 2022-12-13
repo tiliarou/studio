@@ -6,61 +6,54 @@
 
 package studio.webui.api;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import io.vertx.core.Vertx;
-import io.vertx.core.json.Json;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
 import io.vertx.ext.web.Router;
 import studio.webui.service.EvergreenService;
 
 public class EvergreenController {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(EvergreenController.class);
-    
+    private static final Logger LOGGER = LogManager.getLogger(EvergreenController.class);
+
+    private EvergreenController() {
+        throw new IllegalArgumentException("Utility class");
+    }
+
     public static Router apiRouter(Vertx vertx, EvergreenService evergreenService) {
         Router router = Router.router(vertx);
 
         // Current version
-        router.get("/infos").blockingHandler(ctx -> {
-            evergreenService.infos().onComplete(maybeJson -> {
-                if (maybeJson.succeeded()) {
-                    ctx.response()
-                            .putHeader("content-type", "application/json")
-                            .end(Json.encode(maybeJson.result()));
-                } else {
-                    LOGGER.error("Failed to get current version infos");
-                    ctx.fail(500, maybeJson.cause());
-                }
-            });
-        });
+        router.get("/infos").handler(ctx -> evergreenService.infos().onComplete(maybeJson -> {
+            if (maybeJson.succeeded()) {
+                LOGGER.info("Current version infos: {}", maybeJson.result());
+                ctx.json(maybeJson.result());
+            } else {
+                LOGGER.error("Failed to get current version infos");
+                ctx.fail(500, maybeJson.cause());
+            }
+        }));
 
         // Latest release
-        router.get("/latest").blockingHandler(ctx -> {
-            evergreenService.latest().onComplete(maybeJson -> {
-                if (maybeJson.succeeded()) {
-                    ctx.response()
-                            .putHeader("content-type", "application/json")
-                            .end(Json.encode(maybeJson.result()));
-                } else {
-                    LOGGER.error("Failed to get latest release");
-                    ctx.fail(500, maybeJson.cause());
-                }
-            });
-        });
+        router.get("/latest").blockingHandler(ctx -> evergreenService.latest().onComplete(maybeJson -> {
+            if (maybeJson.succeeded()) {
+                ctx.json(maybeJson.result());
+            } else {
+                LOGGER.error("Failed to get latest release");
+                ctx.fail(500, maybeJson.cause());
+            }
+        }));
 
         // Announce
-        router.get("/announce").blockingHandler(ctx -> {
-            evergreenService.announce().setHandler(maybeJson -> {
-                if (maybeJson.succeeded()) {
-                    ctx.response()
-                            .putHeader("content-type", "application/json")
-                            .end(Json.encode(maybeJson.result()));
-                } else {
-                    LOGGER.error("Failed to get announce");
-                    ctx.fail(500, maybeJson.cause());
-                }
-            });
-        });
+        router.get("/announce").blockingHandler(ctx -> evergreenService.announce().onComplete(maybeJson -> {
+            if (maybeJson.succeeded()) {
+                ctx.json(maybeJson.result());
+            } else {
+                LOGGER.error("Failed to get announce");
+                ctx.fail(500, maybeJson.cause());
+            }
+        }));
 
         return router;
     }

@@ -6,146 +6,112 @@
 
 package studio.webui.api;
 
-import io.vertx.core.Future;
-import io.vertx.core.Vertx;
-import io.vertx.core.json.Json;
-import io.vertx.core.json.JsonArray;
-import io.vertx.core.json.JsonObject;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
-import io.vertx.ext.web.Router;
-import studio.core.v1.Constants;
-import studio.webui.service.LibraryService;
 
 import java.nio.file.Path;
-import java.util.Timer;
-import java.util.TimerTask;
+import java.util.Iterator;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import io.vertx.core.Vertx;
+import io.vertx.core.WorkerExecutor;
+import io.vertx.core.json.JsonArray;
+import io.vertx.core.json.JsonObject;
+import io.vertx.ext.web.FileUpload;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.handler.BodyHandler;
+import studio.core.v1.utils.PackFormat;
+import studio.core.v1.utils.exception.StoryTellerException;
+import studio.webui.service.LibraryService;
 
 public class LibraryController {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(LibraryController.class);
-    
+    private static final Logger LOGGER = LogManager.getLogger(LibraryController.class);
+
+    private LibraryController() {
+        throw new IllegalArgumentException("Utility class");
+    }
+
     public static Router apiRouter(Vertx vertx, LibraryService libraryService) {
         Router router = Router.router(vertx);
 
         // Local library device metadata
-        router.get("/infos").blockingHandler(ctx -> {
-            ctx.response()
-                    .putHeader("content-type", "application/json")
-                    .end(Json.encode(libraryService.libraryInfos()));
-        });
+        router.get("/infos").handler(ctx -> ctx.json(libraryService.libraryInfos()));
 
         // Local library packs list
         router.get("/packs").blockingHandler(ctx -> {
+            long t1 = System.currentTimeMillis();
             JsonArray libraryPacks = libraryService.packs();
-            ctx.response()
-                    .putHeader("content-type", "application/json")
-                    .end(Json.encode(libraryPacks));
+            long t2 = System.currentTimeMillis();
+            LOGGER.info("Library packs scanned in {}ms", t2-t1);
+            ctx.json(libraryPacks);
         });
 
         // Local library pack download
-        router.post("/download").blockingHandler(ctx -> {
-            String uuid = ctx.getBodyAsJson().getString("uuid");
+        router.post("/download").handler(ctx -> {
             String packPath = ctx.getBodyAsJson().getString("path");
-            libraryService.getRawPackFile(packPath)
-                    .ifPresentOrElse(
-                            file -> ctx.response()
-                                    .putHeader("Content-Length", "" + file.length())
-                                    .sendFile(file.getAbsolutePath()),
-                            () -> {
-                                LOGGER.error("Failed to download pack from library");
-                                ctx.fail(500);
-                            }
-                    );
+            LOGGER.info("Download {}", packPath);
+            ctx.response().sendFile(libraryService.getPackFile(packPath).toString());
         });
 
         // Local library pack upload
-        router.post("/upload").blockingHandler(ctx -> {
-            String uuid = ctx.request().getFormAttribute("uuid");
+        router.post("/upload").handler(BodyHandler.create() //
+                .setMergeFormAttributes(true) //
+                .setUploadsDirectory(LibraryService.tmpDirPath().toString()));
+
+        router.post("/upload").handler(ctx -> {
             String packPath = ctx.request().getFormAttribute("path");
-            boolean added = libraryService.addPackFile(packPath, ctx.fileUploads().iterator().next().uploadedFileName());
+            LOGGER.info("Upload {}", packPath);
+            boolean added = false;
+            Iterator<FileUpload> it = ctx.fileUploads().iterator();
+            if(it.hasNext()) {
+                added = libraryService.addPackFile(packPath, it.next().uploadedFileName());
+            }
             if (added) {
-                ctx.response()
-                        .putHeader("content-type", "application/json")
-                        .end(Json.encode(new JsonObject().put("success", true)));
+                ctx.json(new JsonObject().put("success", true));
             } else {
-                LOGGER.error("Pack was not added to library");
+                LOGGER.error("Pack {} was not added to library", packPath);
                 ctx.fail(500);
             }
         });
 
         // Local library pack conversion
-        router.post("/convert").blockingHandler(ctx -> {
-            String uuid = ctx.getBodyAsJson().getString("uuid");
-            String packPath = ctx.getBodyAsJson().getString("path");
-            Boolean allowEnriched = ctx.getBodyAsJson().getBoolean("allowEnriched", false);
-            String format = ctx.getBodyAsJson().getString("format");
+        router.post("/convert").handler(ctx -> {
+            JsonObject body = ctx.getBodyAsJson();
+            String packPath = body.getString("path");
+            Boolean allowEnriched = body.getBoolean("allowEnriched", false);
+            String format = body.getString("format");
+
             // Perform conversion/uncompression asynchronously
-            Future<Path> futureConvertedPack = Future.future();
-            if (Constants.PACK_FORMAT_RAW.equalsIgnoreCase(format)) {
-                Timer timer = new Timer();
-                timer.schedule(new TimerTask() {
-                    @Override
-                    public void run() {
-                        libraryService.addConvertedRawPackFile(packPath, allowEnriched)
-                                .ifPresentOrElse(
-                                        packPath -> futureConvertedPack.tryComplete(packPath),
-                                        () -> futureConvertedPack.tryFail("Failed to read or convert pack to raw format"));
-                        futureConvertedPack.tryComplete();
-                    }
-                }, 1000);
-            } else if (Constants.PACK_FORMAT_FS.equalsIgnoreCase(format)) {
-                Timer timer = new Timer();
-                timer.schedule(new TimerTask() {
-                    @Override
-                    public void run() {
-                        libraryService.addConvertedFsPackFile(packPath, allowEnriched)
-                                .ifPresentOrElse(
-                                        packPath -> futureConvertedPack.tryComplete(packPath),
-                                        () -> futureConvertedPack.tryFail("Failed to read or convert pack to folder format"));
-                        futureConvertedPack.tryComplete();
-                    }
-                }, 1000);
-            } else if (Constants.PACK_FORMAT_ARCHIVE.equalsIgnoreCase(format)) {
-                Timer timer = new Timer();
-                timer.schedule(new TimerTask() {
-                    @Override
-                    public void run() {
-                        libraryService.addConvertedArchivePackFile(packPath)
-                                .ifPresentOrElse(
-                                        packPath -> futureConvertedPack.tryComplete(packPath),
-                                        () -> futureConvertedPack.tryFail("Failed to read or convert pack to folder format"));
-                        futureConvertedPack.tryComplete();
-                    }
-                }, 1000);
-            } else {
-                ctx.fail(400);
-                return;
-            }
-            futureConvertedPack.onComplete(maybeConvertedPack -> {
-                if (maybeConvertedPack.succeeded()) {
-                    // Return path to converted file within library
-                    ctx.response()
-                            .putHeader("content-type", "application/json")
-                            .end(Json.encode(new JsonObject()
-                                    .put("success", true)
-                                    .put("path", maybeConvertedPack.result().toString())
-                            ));
-                } else {
-                    LOGGER.error("Failed to read or convert pack");
-                    ctx.fail(500, maybeConvertedPack.cause());
-                }
-            });
+            WorkerExecutor executor = vertx.createSharedWorkerExecutor("pack-converter", 1, 20, TimeUnit.MINUTES);
+            executor.executeBlocking( //
+                    future -> {
+                        try {
+                            PackFormat packFormat = PackFormat.valueOf(format.toUpperCase());
+                            Path newPackPath = libraryService.addConvertedPack(packPath, packFormat, allowEnriched);
+                            future.complete(newPackPath);
+                        } catch (IllegalArgumentException | StoryTellerException e) {
+                            future.fail(e);
+                        }
+                    }, //
+                    res -> {
+                        if (res.succeeded()) {
+                            // Return path to converted file within library
+                            ctx.json(new JsonObject().put("success", true).put("path", res.result().toString()));
+                        } else {
+                            LOGGER.error("Failed to read or convert pack");
+                            ctx.fail(500, res.cause());
+                        }
+                    });
         });
 
         // Remove pack from device
-        router.post("/remove").blockingHandler(ctx -> {
+        router.post("/remove").handler(ctx -> {
             String packPath = ctx.getBodyAsJson().getString("path");
             boolean removed = libraryService.deletePack(packPath);
             if (removed) {
-                ctx.response()
-                        .putHeader("content-type", "application/json")
-                        .end(Json.encode(new JsonObject().put("success", true)));
+                ctx.json(new JsonObject().put("success", true));
             } else {
                 LOGGER.error("Pack was not removed from library");
                 ctx.fail(500);
